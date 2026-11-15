@@ -12,7 +12,8 @@ def metadata():
             "parameters": [{"key": "zone", "label": "分析展区", "type": "select", "default": "全部", "options": [{"value": x, "label": x} for x in ["全部", "星空厅", "水世界", "机械坊"]]}, {"key": "alpha", "label": "显著性水平", "type": "select", "default": "0.05", "options": [{"value": str(x), "label": str(x)} for x in [.01, .05, .1]]}],
             "workbench_title": "导览列联核验", "action_label": "构建列联表并检验", "unit": "人", "accent": "oklch(56% 0.15 18)", "style": "gallery",
             "seed_story": ["08:30 导入 SG_guide_counts.csv，三展区共 120 条日计数。", "08:45 核对完成数不超过进区人数。", "09:00 选择全部展区，显著性水平 0.05。", "09:05 运行核验，查看完成/未完成列联表。", "09:20 检查最小期望频数及 Cramer V。", "09:40 分别选水世界与机械坊，比较分区差异。", "10:00 导出评审简报，计划按访客随机分组的后续试点。"],
-            "method": "汇总 A/B×完成/未完成 2×2 列联表，Pearson χ² 不使用连续性校正；Cramer V=√(χ²/N)；最小期望频数低于 5 时提示近似条件不足。", "limitations": ["按日汇总可能存在访客重复和聚类", "全部展区汇总可能受分区构成影响", "关联不等同于因果提升"]}
+            "method": "汇总 A/B×完成/未完成 2×2 列联表，Pearson χ² 不使用连续性校正；Cramer V=√(χ²/N)；最小期望频数低于 5 时提示近似条件不足。", "limitations": ["按日汇总可能存在访客重复和聚类", "全部展区汇总可能受分区构成影响", "关联不等同于因果提升"],
+            "rule_page_title": "展区归并规则版本"}
 
 
 def seed_records():
@@ -29,21 +30,47 @@ def seed_records():
 
 
 def analyze(records, params):
+    """Base-version analysis: raw zone names are used as-is."""
+    return analyze_mapped(records, params, mapping=None, targets=None)
+
+
+def analyze_mapped(records, params, mapping=None, targets=None, version=0, version_name=''):
+    """Analyse records after applying a zone rule version.
+
+    ``mapping`` maps raw zone -> merged zone.  ``targets`` is the complete set
+    of merged zone names; when it is given, every raw zone must resolve to
+    exactly one target or the whole group of counts is rejected (no silent
+    partial roll-up).  Each result therefore belongs to exactly one version.
+    """
+    mapping = {str(k): str(v) for k, v in (mapping or {}).items()}
+    targets = set(str(t) for t in targets) if targets else set()
     zone = str(params.get("zone", "全部"))
     try:
         alpha = float(params.get("alpha", .05))
     except (ValueError, TypeError):
         raise ValueError("显著性水平必须为 0.01/0.05/0.1")
-    if alpha not in (.01, .05, .1) or zone not in ("全部", "星空厅", "水世界", "机械坊"):
+    if alpha not in (.01, .05, .1):
         raise ValueError("未知展区或显著性水平")
+    if zone != "全部":
+        known = targets or {str(r.get("zone")) for r in records if isinstance(r, dict)}
+        if zone not in known:
+            raise ValueError("未知展区或显著性水平")
     total = {"A": [0, 0], "B": [0, 0]}
     zones = {}
     for r in records:
         try:
             v, c = float(r["visitors"]), float(r["completed"])
-            name, arm = str(r["zone"]), str(r["arm"])
+            raw, arm = str(r["zone"]), str(r["arm"])
             if arm not in total or not all(math.isfinite(x) and x.is_integer() for x in (v, c)) or v <= 0 or not 0 <= c <= v:
                 raise ValueError()
+            if raw in mapping:
+                name = mapping[raw]
+            elif targets:
+                if raw not in targets:
+                    raise ValueError(f"展区“{raw}”未归属到任何归并后展区，整组规则不生效")
+                name = raw
+            else:
+                name = raw
             if zone != "全部" and zone != name:
                 continue
             total[arm][0] += int(c)
@@ -51,7 +78,9 @@ def analyze(records, params):
             bucket = zones.setdefault((name, arm), [0, 0])
             bucket[0] += int(v)
             bucket[1] += int(c)
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError) as exc:
+            if str(exc).startswith("展区"):
+                raise
             raise ValueError("方案须为 A/B，人数为整数，且 0≤完成≤进区")
     observed = np.array([total["A"], total["B"]], dtype=float)
     if np.any(observed.sum(axis=0) == 0) or np.any(observed.sum(axis=1) == 0):
@@ -64,8 +93,20 @@ def analyze(records, params):
     warnings = ["汇总分析未控制分区和日期的访客构成，不能直接归因于导览设计。"]
     if min_expected < 5:
         warnings.append("至少一个期望频数小于 5；χ² 渐近 p 值可靠性不足，请扩大样本或采用精确检验。")
-    return {"summary": f"{zone}：B−A 完成率差 {rates['B']-rates['A']:.3f} 个百分点，χ²={chi:.3f}，{'检出关联' if p < alpha else '未检出关联'}。",
+    if version:
+        warnings.insert(0, f"本结果按展区归并规则 v{version}「{version_name}」计算；原始计数已一次性归入合并后的展区。")
+    findings = [f"A 完成 {total['A'][0]} / {sum(total['A'])}，B 完成 {total['B'][0]} / {sum(total['B'])}。", f"有效样本 N={n}，自由度={int(df)}；检验 α={alpha:g}。", "逐展区复核构成差异后再设计下一轮随机试点。"]
+    if mapping:
+        findings.insert(1, "归并映射：" + "，".join(f"{k}→{v2}" for k, v2 in sorted(mapping.items())) + "。")
+    result = {"summary": f"{zone}：B−A 完成率差 {rates['B']-rates['A']:.3f} 个百分点，χ²={chi:.3f}，{'检出关联' if p < alpha else '未检出关联'}。",
             "metrics": [{"label": "Pearson χ²", "value": round(float(chi), 5)}, {"label": "p 值", "value": float(f"{p:.6g}")}, {"label": "Cramer V", "value": round(v, 5)}, {"label": "最小期望频数", "value": round(min_expected, 3)}],
             "table": {"columns": [{"key": "zone", "label": "展区"}, {"key": "arm", "label": "方案"}, {"key": "visitors", "label": "进区"}, {"key": "completed", "label": "完成"}, {"key": "incomplete", "label": "未完成"}, {"key": "rate", "label": "完成率 %"}], "rows": rows},
             "chart": {"type": "bar", "labels": ["A 方案", "B 方案"], "series": [{"name": "完成率 %", "values": [round(rates["A"], 4), round(rates["B"], 4)]}]},
-            "findings": [f"A 完成 {total['A'][0]} / {sum(total['A'])}，B 完成 {total['B'][0]} / {sum(total['B'])}。", f"有效样本 N={n}，自由度={int(df)}；检验 α={alpha:g}。", "逐展区复核构成差异后再设计下一轮随机试点。"], "method": metadata()["method"], "warnings": warnings}
+            "findings": findings, "method": metadata()["method"], "warnings": warnings}
+    # Base-version results keep the original output contract; rule-version
+    # results additionally record which version produced them.
+    if version:
+        result["zone_version"] = int(version)
+        result["zone_version_name"] = version_name or ''
+        result["zone_rules"] = [{"source": k, "target": v2} for k, v2 in sorted(mapping.items())]
+    return result

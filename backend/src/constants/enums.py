@@ -8,3 +8,22 @@ class JobStatus(str, Enum):
     running = 'running'
     completed = 'completed'
     failed = 'failed'
+    superseded = 'superseded'
+class RuleVersionStatus(str, Enum):
+    ready = 'ready'
+    building = 'building'
+    active = 'active'
+    blocked = 'blocked'
+    failed = 'failed'
+    superseded = 'superseded'
+    rolled_back = 'rolled_back'
+class RuleBatchStatus(str, Enum):
+    pending = 'pending'
+    running = 'running'
+    completed = 'completed'
+    blocked = 'blocked'
+    failed = 'failed'
+class RuleStageStatus(str, Enum):
+    pending = 'pending'
+    completed = 'completed'
+    failed = 'failed'
